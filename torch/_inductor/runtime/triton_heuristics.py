@@ -1382,6 +1382,9 @@ class CachingAutotuner(KernelInterface):
             for k in tlx_only_cuda_options():
                 if v := getattr(cfg, k, None):
                     options[k] = v
+            # A Config's register cap is a triton.compile option, like num_warps.
+            if (maxnreg := getattr(cfg, "maxnreg", None)) is not None:
+                options["maxnreg"] = maxnreg
         # Backend options are consumed by Triton out-of-band from the kernel
         # signature. They are intentionally *not* present in `constants`.
         options.update(compile_meta.get("backend_options", {}))
@@ -5189,6 +5192,10 @@ def config_to_dict(config: Config) -> dict[str, Any]:
         "num_warps": config.num_warps,
         "num_stages": config.num_stages,
     }
+    # config_from_dict pops maxnreg back out (_pop_config_kwargs), so it must
+    # survive the round trip or a user config's register cap silently vanishes.
+    if getattr(config, "maxnreg", None) is not None:
+        config_dict["maxnreg"] = config.maxnreg
     if HAS_WARP_SPEC:
         config_dict.update(
             {
