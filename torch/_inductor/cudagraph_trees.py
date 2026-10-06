@@ -63,6 +63,7 @@ from torch._dynamo.graph_bytecode_inputs import (
 )
 from torch._dynamo.mutation_guard import GenerationTracker
 from torch._dynamo.utils import counters, dynamo_timed, preserve_rng_state
+from torch._functorch._aot_autograd.runtime_wrappers import current_autograd_invocation
 from torch._higher_order_ops.cudagraph_conditional_nodes import (
     ControlFlowOpWarmupDispatchMode,
     CUDAGraphCaptureControlFlowOpDispatchMode,
@@ -78,6 +79,7 @@ from torch._inductor.compile_fx import (
     static_input,
 )
 from torch._inductor.cudagraph_utils import (
+    BoxedDeviceIndex,
     check_for_mutation,
     CheckInvariantStatus,
     collect_cuda_data_ptrs,
@@ -577,6 +579,7 @@ def cudagraphify(
     cudagraph_managed_input_rerecord_action: Literal["copy", "skip"] | None = None,
     cudagraph_initial_mempool_allocation_gb: float | None = None,
     compile_id: CompileId | None = None,
+    forward_device_index: BoxedDeviceIndex | None = None,
 ) -> tuple[ModelType, OutputType]:
     if is_backward and is_inference:
         raise AssertionError("expected not (is_backward and is_inference)")
@@ -613,6 +616,7 @@ def cudagraphify(
         compile_id,
         cudagraph_managed_input_rerecord_limit,
         cudagraph_managed_input_rerecord_action,
+        forward_device_index=forward_device_index,
     )
 
 
@@ -2535,6 +2539,11 @@ class CUDAGraphTreeManager:
 
         self.id_to_mode: dict[FunctionID, CompilationMode] = {}
         self.id_to_compile_id: dict[FunctionID, CompileId | None] = {}
+        # A forward whose backward may signal its own transition (see
+        # maybe_handle_backward_generation) records here each autograd invocation
+        # that actually ran in the tree, so a call that fell back to eager does
+        # not count as captured.
+        self.ids_to_forward_device_index: dict[FunctionID, BoxedDeviceIndex] = {}
         # Whether the current run() executes in the tree (warmup, recording or
         # replay) rather than falling back to the eager model. Only a forward
         # run in the tree leaves outputs here that its backward still needs.
@@ -2890,15 +2899,21 @@ class CUDAGraphTreeManager:
         self.roots = None  # type: ignore[assignment]
         self.current_node = None
 
-    def _note_tree_run(self) -> None:
+    def _note_tree_run(self, function_id: FunctionID) -> None:
         self.ran_in_tree = True
+        box = self.ids_to_forward_device_index.get(function_id)
+        if (
+            box is not None
+            and (invocation := current_autograd_invocation()) is not None
+        ):
+            box.captured_invocations.add(invocation)
 
     def record_function(
         self, new_inputs: list[InputType], function_id: FunctionID
     ) -> OutputType:
         if isinstance(self.current_node, CUDAWarmupNode):
             raise AssertionError("expected current_node to not be a CUDAWarmupNode")
-        self._note_tree_run()
+        self._note_tree_run(function_id)
         with torch._dynamo.callback_handler.install_callbacks(
             CallbackTrigger.CUDAGRAPH_RECORDING, str(self.compile_id)
         ):
@@ -2939,7 +2954,7 @@ class CUDAGraphTreeManager:
     def execute_node(
         self, node: CUDAGraphNode, new_inputs: list[InputType]
     ) -> OutputType:
-        self._note_tree_run()
+        self._note_tree_run(node.wrapped_function.id)
         self.current_node = node
         self.path_state = ExecutionState.EXECUTION
         self.update_generation()
@@ -2950,7 +2965,7 @@ class CUDAGraphTreeManager:
     ) -> OutputType:
         # this is only stored on current node, because when we start a new path,
         # we will deallocate it
-        self._note_tree_run()
+        self._note_tree_run(function_id)
         already_warm = function_id in self.warmed_up_functions
         func_name = self.get_func_name(function_id)
         if not already_warm:
@@ -3014,11 +3029,14 @@ class CUDAGraphTreeManager:
         compile_id: CompileId | None,
         cudagraph_managed_input_rerecord_limit: int,
         cudagraph_managed_input_rerecord_action: Literal["copy", "skip"],
+        forward_device_index: BoxedDeviceIndex | None = None,
     ) -> tuple[
         ModelType,
         OutputType,
     ]:
         id = self.new_func_id()
+        if forward_device_index is not None:
+            self.ids_to_forward_device_index[id] = forward_device_index
         if mode == CompilationMode.BACKWARD:
             user_visible_output_idxs = ()
         user_visible_output_idxs_set = frozenset(user_visible_output_idxs)
